@@ -149,14 +149,15 @@ class Database:
     def _bootstrap(self) -> None:
         self.db.execute("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
         current = self.one("SELECT value FROM meta WHERE key = 'data_version'")
-        if not current or int(current["value"]) < DATA_VERSION:
-            # This is the requested major reset. It runs once, then the new state persists.
-            for table in ("users", "countries", "wars", "relations", "alliances",
-                          "alliance_members", "alliance_invites", "repairs"):
-                self.db.execute(f"DROP TABLE IF EXISTS {table}")
-            self.db.execute("DELETE FROM meta")
+        if not current:
+            # Новая база создаётся пустой, но существующие таблицы никогда не удаляются.
             self.db.execute(
                 "INSERT INTO meta (key, value) VALUES ('data_version', ?)", (str(DATA_VERSION),)
+            )
+        elif int(current["value"]) < DATA_VERSION:
+            # Миграции ниже аддитивные: старый игровой прогресс сохраняется.
+            self.db.execute(
+                "UPDATE meta SET value = ? WHERE key = 'data_version'", (str(DATA_VERSION),)
             )
         self.db.executescript(
             """
@@ -364,7 +365,15 @@ class KovchegBot(commands.Bot):
         intents.message_content = True
         intents.voice_states = True
         super().__init__(command_prefix=commands.when_mentioned, intents=intents, help_command=None)
-        self.db = Database()
+        # DATABASE_PATH имеет приоритет. Если панель хостинга не позволяет
+        # сохранить эту переменную, используем уже настроенный DATA_DIR.
+        database_path = os.getenv("DATABASE_PATH")
+        if not database_path:
+            data_path = os.path.join(os.getenv("DATA_DIR", "."), "kovcheg.sqlite3")
+            # Не создаём новую базу в пустой DATA_DIR, если старая база
+            # уже лежит в рабочей папке приложения (например, /app).
+            database_path = data_path if os.path.exists(data_path) else "kovcheg.sqlite3"
+        self.db = Database(database_path)
         self.voice_sessions: dict[tuple[int, int], float] = {}
         self.synced = False
         self.last_summary_year: dict[int, int] = {}

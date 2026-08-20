@@ -1,0 +1,4 @@
+kovcheg.sqlite3
+kovcheg.sqlite3-*
+__pycache__/
+.env
