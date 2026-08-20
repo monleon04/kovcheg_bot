@@ -193,6 +193,7 @@ class Database:
                 last_social_at REAL NOT NULL DEFAULT 0,
                 war_exhaustion INTEGER NOT NULL DEFAULT 0,
                 active_party TEXT NOT NULL DEFAULT 'Гражданская коалиция',
+                martial_law INTEGER NOT NULL DEFAULT 0,
                 PRIMARY KEY (guild_id, country_key)
             );
             CREATE TABLE IF NOT EXISTS wars (
@@ -268,6 +269,7 @@ class Database:
             ("war_exhaustion", "INTEGER NOT NULL DEFAULT 0"),
             ("active_party", "TEXT NOT NULL DEFAULT 'Гражданская коалиция'"),
             ("vector_change_at", "REAL NOT NULL DEFAULT 0"),
+            ("martial_law", "INTEGER NOT NULL DEFAULT 0"),
         ):
             if name not in columns:
                 self.db.execute(f"ALTER TABLE countries ADD COLUMN {name} {definition}")
@@ -511,8 +513,15 @@ class KovchegBot(commands.Bot):
         )["n"]
         exodus = max(0, country["crime"] - 45) + max(0, 55 - country["quality_of_life"])
         exhaustion = min(8, wars * 2 + country["war_exhaustion"] // 12)
-        population_delta = int(country["population"] * max(-0.0008, 0.001 + country["quality_of_life"] / 100000 - exodus / 100000))
+        natural_growth = 0.001 + country["quality_of_life"] / 100000 - exodus / 100000
+        if country["martial_law"]:
+            # Военное положение заметно снижает рождаемость и может дать
+            # отрицательную демографию при низком качестве жизни.
+            natural_growth -= 0.0025
+        population_delta = int(country["population"] * max(-0.0008, natural_growth))
         approval_delta = ideology["social"] // 6 - wars - country["crime"] // 35
+        if country["martial_law"]:
+            approval_delta -= 1
         self.db.execute(
             """UPDATE countries SET population = MAX(1000, population + ?),
                quality_of_life = MAX(0, MIN(100, quality_of_life + ?)),
@@ -531,9 +540,11 @@ class KovchegBot(commands.Bot):
         )
         for movement in movements:
             drift = random.choice([-2, -1, 0, 0, 1, 2])
-            if movement["ideology"] == country["ideology"]:
+            if country["martial_law"]:
+                drift = 0
+            elif movement["ideology"] == country["ideology"]:
                 drift += 1
-            if wars:
+            if wars and not country["martial_law"]:
                 drift -= 1
             self.db.execute(
                 "UPDATE political_movements SET support = MAX(0, MIN(100, support + ?)) WHERE id = ?",
@@ -544,7 +555,7 @@ class KovchegBot(commands.Bot):
             "ORDER BY support DESC LIMIT 2",
             (guild.id, country["country_key"]),
         )
-        if candidates and candidates[0]["support"] >= 35 and random.random() < 0.35:
+        if not country["martial_law"] and candidates and candidates[0]["support"] >= 35 and random.random() < 0.35:
             winner = candidates[0]
             self.db.execute(
                 "UPDATE countries SET active_party = ?, ideology = ?, approval = MAX(0, approval - 4) "
@@ -655,8 +666,12 @@ class KovchegBot(commands.Bot):
         defense_bonus = (defender["capital_fort"] if war["pending_target"] == "capital" else defender["province_fort"]) * 0.08
         defense_bonus += (war["defender_bonus"] if war["pending_side"] == "attacker" else war["attacker_bonus"]) * 0.15
         attack_power = (troops + min(shared_army, troops // 2)) * random.uniform(.8, 1.2) * (1 + attacker_ideology["war"])
+        if attacker["martial_law"]:
+            attack_power *= 1.05
         attack_power += siege_bonus + fleet_bonus
         defense_power = defender["army"] * (1 + defense_bonus + defender_ideology["defense"]) * (0.75 + defender["morale"] / 400)
+        if defender["martial_law"]:
+            defense_power *= 1.10
         won = attack_power >= defense_power * random.uniform(.72, 1.15)
         attacker_losses = max(1, int(troops * random.uniform(.06, .18)))
         defender_losses = max(1, int(defender["army"] * random.uniform(.04, .14)))
@@ -795,7 +810,7 @@ class GameCog(commands.Cog):
             return False
         return True
 
-    @app_commands.command(name="pomosh", description="Показать команды Ковчега")
+    @app_commands.command(name="помощь", description="Показать команды Ковчега")
     async def help(self, interaction: discord.Interaction):
         await interaction.response.send_message(
             "**Ковчег — команды**\n"
@@ -818,7 +833,7 @@ class GameCog(commands.Cog):
             "в именах application-команд; все описания и параметры переведены на русский."
         )
 
-    @app_commands.command(name="kartochka", description="Показать карточку и единый баланс участника")
+    @app_commands.command(name="карточка", description="Показать карточку и единый баланс участника")
     @app_commands.describe(member="Участник")
     async def card(self, interaction: discord.Interaction, member: Optional[discord.Member] = None):
         guild = await self.guild(interaction)
@@ -911,7 +926,7 @@ class GameCog(commands.Cog):
             f"Ваш стартовый баланс: **{fmt(selected['treasury'])} кок**."
         )
 
-    @app_commands.command(name="sostoyanie", description="Показать состояние страны")
+    @app_commands.command(name="состояние", description="Показать состояние страны")
     @app_commands.describe(country="Страна")
     @app_commands.choices(country=ALL_CHOICES)
     async def status(self, interaction: discord.Interaction, country: Optional[app_commands.Choice[str]] = None):
@@ -937,11 +952,24 @@ class GameCog(commands.Cog):
         ideology = IDEOLOGIES.get(row["ideology"], IDEOLOGIES["democracy"])
         embed.add_field(name="Социалка", value=f"Качество жизни {row['quality_of_life']}%\n"
                         f"Одобрение власти {row['approval']}%\nПреступность {row['crime']}%\n"
-                        f"Стабильность {row['stability']}%\nВектор: {ideology['name']}")
+                        f"Стабильность {row['stability']}%\nВектор: {ideology['name']}\n"
+                        f"Военное положение: {'Да' if row['martial_law'] else 'Нет'}")
         embed.add_field(name="Провинции", value=f"{row['provinces']} / {row['max_provinces']}")
         embed.add_field(name="Казна / баланс", value=f"{fmt(row['treasury'])} кок")
         embed.add_field(name="Армия", value=f"{fmt(row['army'])}\nБоевой дух: {row['morale']}%")
-        embed.add_field(name="Состав", value=f"Мечники {fmt(row['swordsmen'])}\nЛучники {fmt(row['archers'])}\nОсадные {fmt(row['siege'])}\nТребушеты {fmt(row['trebuchets'])}")
+        embed.add_field(
+            name="Состав войск",
+            value=f"Мечники: {fmt(row['swordsmen'])}\n"
+                  f"Лучники: {fmt(row['archers'])}\n"
+                  f"Осадные орудия: {fmt(row['siege'])}\n"
+                  f"Требушеты: {fmt(row['trebuchets'])}\n"
+                  f"Конница: {fmt(row['cavalry'])}\n"
+                  f"Морской десант: {fmt(row['marines'])}\n"
+                  f"Флот: {fmt(row['fleet'])}\n"
+                  f"Верфь: {fmt(row['shipyard'])}\n"
+                  f"Генералы: {fmt(row['generals'])}",
+            inline=False,
+        )
         embed.add_field(name="Предприятия", value=f"Ур. {row['industry_level']}\nУкрепление столицы {row['capital_fort']}\nПровинции {row['province_fort']}")
         embed.add_field(name="Войны", value=str(len(wars)) if wars else "Нет")
         alliance_text = "Нет"
@@ -1013,6 +1041,11 @@ class GameCog(commands.Cog):
         source = await self.active_country(interaction) if guild else None
         if not source:
             return
+        if source["martial_law"]:
+            await interaction.response.send_message(
+                "Смена политического вектора при военном положении запрещена.", ephemeral=True
+            )
+            return
         if source["ideology"] == ideology.value:
             await interaction.response.send_message("Этот политический вектор уже установлен.", ephemeral=True)
             return
@@ -1046,7 +1079,7 @@ class GameCog(commands.Cog):
             f"{IDEOLOGIES[ideology.value]['description']}"
         )
 
-    @app_commands.command(name="partii", description="Показать партии и локальные движения страны")
+    @app_commands.command(name="партии", description="Показать партии и локальные движения страны")
     async def parties(self, interaction: discord.Interaction):
         guild = await self.guild(interaction)
         source = await self.country(interaction) if guild else None
@@ -1063,7 +1096,7 @@ class GameCog(commands.Cog):
         ) or "Партий пока нет."
         await interaction.response.send_message(text)
 
-    @app_commands.command(name="dvizhenie", description="Создать локальное политическое движение")
+    @app_commands.command(name="создать_партию", description="Создать политическую партию")
     @app_commands.describe(name="Название партии", effect="Чего требует партия", ideology="Вектор партии")
     @app_commands.choices(ideology=[
         app_commands.Choice(name=data["name"], value=key) for key, data in IDEOLOGIES.items()])
@@ -1072,6 +1105,11 @@ class GameCog(commands.Cog):
         guild = await self.guild(interaction)
         source = await self.active_country(interaction) if guild else None
         if not source:
+            return
+        if source["martial_law"]:
+            await interaction.response.send_message(
+                "При военном положении продвижение партий запрещено.", ephemeral=True
+            )
             return
         count = self.bot.db.one("SELECT COUNT(*) AS n FROM political_movements WHERE guild_id = ? AND country_key = ?",
                                 (guild.id, source["country_key"]))["n"]
@@ -1098,6 +1136,11 @@ class GameCog(commands.Cog):
         source = await self.active_country(interaction) if guild else None
         if not source:
             return
+        if source["martial_law"]:
+            await interaction.response.send_message(
+                "При военном положении деятельность партий приостановлена.", ephemeral=True
+            )
+            return
         amount = max(1_000, min(100_000, amount))
         party = self.bot.db.one(
             "SELECT * FROM political_movements WHERE guild_id = ? AND country_key = ? "
@@ -1117,6 +1160,43 @@ class GameCog(commands.Cog):
         )
         await interaction.response.send_message(
             f"📣 Продвижение партии **{party['name']}** завершено: +{points}% популярности за {fmt(amount)} кок."
+        )
+
+    @app_commands.command(name="военное_положение", description="Ввести военное положение в своей стране")
+    async def martial_law_on(self, interaction: discord.Interaction):
+        guild = await self.guild(interaction)
+        source = await self.active_country(interaction) if guild else None
+        if not source:
+            return
+        if source["martial_law"]:
+            await interaction.response.send_message("Военное положение уже действует.", ephemeral=True)
+            return
+        self.bot.db.execute(
+            "UPDATE countries SET martial_law = 1, approval = MAX(0, approval - 5), "
+            "stability = MAX(0, stability - 5) WHERE guild_id = ? AND country_key = ?",
+            (guild.id, source["country_key"]),
+        )
+        await interaction.response.send_message(
+            "⚠️ В стране введено военное положение.\n"
+            "Рождаемость снижена, партии приостановлены, "
+            "защита получила +10%, атака +5%."
+        )
+
+    @app_commands.command(name="отменить_военное_положение", description="Отменить военное положение")
+    async def martial_law_off(self, interaction: discord.Interaction):
+        guild = await self.guild(interaction)
+        source = await self.active_country(interaction) if guild else None
+        if not source:
+            return
+        if not source["martial_law"]:
+            await interaction.response.send_message("Военное положение не введено.", ephemeral=True)
+            return
+        self.bot.db.execute(
+            "UPDATE countries SET martial_law = 0 WHERE guild_id = ? AND country_key = ?",
+            (guild.id, source["country_key"]),
+        )
+        await interaction.response.send_message(
+            "✅ Военное положение отменено. Политические партии возобновляют деятельность."
         )
 
     @app_commands.command(name="naemniki", description="Показать доступные ЧВК и контракты")
@@ -1839,7 +1919,7 @@ class GameCog(commands.Cog):
         self.bot.db.execute("UPDATE countries SET industry_level = ?, last_income_at = ? WHERE guild_id = ? AND country_key = ?", (level, time.time(), interaction.guild.id, country.value))
         await interaction.response.send_message(f"Уровень предприятий установлен: {level}.", ephemeral=True)
 
-    @app_commands.command(name="admin_dobavit_predpriyatie", description="Админ: добавить предприятие и установить его уровень")
+    @app_commands.command(name="админ_добавить_предприятие", description="Админ: добавить предприятие и установить его уровень")
     @app_commands.describe(code="Защитный код", country="Страна",
                            level="Итоговый уровень предприятий от 0 до 5")
     @app_commands.choices(country=ALL_CHOICES)
