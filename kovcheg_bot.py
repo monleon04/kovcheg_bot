@@ -232,7 +232,8 @@ class Database:
             CREATE TABLE IF NOT EXISTS political_movements (
                 id INTEGER PRIMARY KEY AUTOINCREMENT, guild_id INTEGER NOT NULL,
                 country_key TEXT NOT NULL, name TEXT NOT NULL, effect TEXT NOT NULL,
-                support INTEGER NOT NULL DEFAULT 10, created_at REAL NOT NULL
+                support INTEGER NOT NULL DEFAULT 10, created_at REAL NOT NULL,
+                ideology TEXT NOT NULL DEFAULT 'democracy', leader_id INTEGER
             );
             CREATE TABLE IF NOT EXISTS alliance_roles (
                 alliance_id INTEGER NOT NULL, country_key TEXT NOT NULL,
@@ -265,9 +266,17 @@ class Database:
             ("last_social_at", "REAL NOT NULL DEFAULT 0"),
             ("war_exhaustion", "INTEGER NOT NULL DEFAULT 0"),
             ("active_party", "TEXT NOT NULL DEFAULT 'Гражданская коалиция'"),
+            ("vector_change_at", "REAL NOT NULL DEFAULT 0"),
         ):
             if name not in columns:
                 self.db.execute(f"ALTER TABLE countries ADD COLUMN {name} {definition}")
+        movement_columns = {row["name"] for row in self.db.execute("PRAGMA table_info(political_movements)").fetchall()}
+        for name, definition in (
+            ("ideology", "TEXT NOT NULL DEFAULT 'democracy'"),
+            ("leader_id", "INTEGER"),
+        ):
+            if name not in movement_columns:
+                self.db.execute(f"ALTER TABLE political_movements ADD COLUMN {name} {definition}")
         self.db.commit()
 
     def execute(self, query: str, params: tuple = ()) -> sqlite3.Cursor:
@@ -505,6 +514,34 @@ class KovchegBot(commands.Bot):
             (population_delta, 1 if not wars and country["crime"] < 40 else -1,
              approval_delta - exhaustion, now, guild.id, country["country_key"]),
         )
+        # Популярность партий меняется сама: совпадение с текущим вектором
+        # помогает, а кризисы и войны ускоряют падение поддержки.
+        movements = self.db.all(
+            "SELECT * FROM political_movements WHERE guild_id = ? AND country_key = ?",
+            (guild.id, country["country_key"]),
+        )
+        for movement in movements:
+            drift = random.choice([-2, -1, 0, 0, 1, 2])
+            if movement["ideology"] == country["ideology"]:
+                drift += 1
+            if wars:
+                drift -= 1
+            self.db.execute(
+                "UPDATE political_movements SET support = MAX(0, MIN(100, support + ?)) WHERE id = ?",
+                (drift, movement["id"]),
+            )
+        candidates = self.db.all(
+            "SELECT * FROM political_movements WHERE guild_id = ? AND country_key = ? "
+            "ORDER BY support DESC LIMIT 2",
+            (guild.id, country["country_key"]),
+        )
+        if candidates and candidates[0]["support"] >= 35 and random.random() < 0.35:
+            winner = candidates[0]
+            self.db.execute(
+                "UPDATE countries SET active_party = ?, ideology = ?, approval = MAX(0, approval - 4) "
+                "WHERE guild_id = ? AND country_key = ?",
+                (winner["name"], winner["ideology"], guild.id, country["country_key"]),
+            )
 
     async def expire_mercenaries(self, guild: discord.Guild, country: sqlite3.Row):
         contracts = self.db.all(
@@ -761,8 +798,15 @@ class GameCog(commands.Cog):
             "`soyuz_sozdat`, `soyuz_priglasit`, `soyuz_prinyat`, `soyuz_vyiti`, "
             "`soyuz_isklyuchit`, `soyuz_nalog`, `soyuz_sobrat`, `soyuz_status`, `soyuz_cel`, "
             "`soyuz_vklad`, `soyuz_nagrada`, `soyuz_rol`, `soyuz_armiya`, `soyuz_zapros`\n"
-            "`socialka`, `ideologiya`, `partii`, `dvizhenie`, `naemniki`, `naemnik_nanyat`\n"
-            "Админ-команды требуют права администратора и код `/admin_*`."
+            "`socialka`, `ideologiya`, `partii`, `dvizhenie`, `prodvinut_partiyu`, "
+            "`naemniki`, `naemnik_nanyat`\n"
+            "Админ-команды: `admin_balans`, `admin_dobavit_balans`, `admin_xp`, "
+            "`admin_uroven`, `admin_armiya`, `admin_moral`, `admin_provincii`, "
+            "`admin_predpriyatie`, `admin_dobavit_predpriyatie`, `admin_resursy`, "
+            "`admin_naselenie`, `admin_kazna`, `admin_user_stat`, `admin_politika`, "
+            "`admin_vektor`, `admin_sbros`.\n"
+            "Названия slash-команд оставлены в транслитерации: Discord не принимает кириллицу "
+            "в именах application-команд; все описания и параметры переведены на русский."
         )
 
     @app_commands.command(name="kartochka", description="Показать карточку и единый баланс участника")
@@ -830,9 +874,12 @@ class GameCog(commands.Cog):
         await interaction.response.send_message(f"{interaction.user.mention} перевёл {member.mention} **{fmt(amount)} кок**.")
 
     @app_commands.command(name="vybrat", description="Навсегда выбрать активную страну")
-    @app_commands.describe(country="Страна")
+    @app_commands.describe(country="Страна", ideology="Начальный политический вектор")
     @app_commands.choices(country=ACTIVE_CHOICES)
-    async def choose(self, interaction: discord.Interaction, country: app_commands.Choice[str]):
+    @app_commands.choices(ideology=[
+        app_commands.Choice(name=data["name"], value=key) for key, data in IDEOLOGIES.items()])
+    async def choose(self, interaction: discord.Interaction, country: app_commands.Choice[str],
+                     ideology: app_commands.Choice[str]):
         guild = await self.guild(interaction)
         if not guild:
             return
@@ -846,12 +893,13 @@ class GameCog(commands.Cog):
             return
         self.bot.db.execute("UPDATE users SET country_key = ?, coins = ? WHERE guild_id = ? AND user_id = ?",
                             (country.value, selected["treasury"], guild.id, interaction.user.id))
-        self.bot.db.execute("UPDATE countries SET owner_id = ?, treasury = ? WHERE guild_id = ? AND country_key = ?",
-                            (interaction.user.id, selected["treasury"], guild.id, country.value))
+        self.bot.db.execute("UPDATE countries SET owner_id = ?, treasury = ?, ideology = ? WHERE guild_id = ? AND country_key = ?",
+                            (interaction.user.id, selected["treasury"], ideology.value, guild.id, country.value))
         await self.bot.level_role(guild, interaction.user)
         await interaction.response.send_message(
-            f"{interaction.user.mention}, вы навсегда выбрали **{selected['name']}**. "
-            f"Ваш единый стартовый баланс: **{fmt(selected['treasury'])} кок**."
+            f"{interaction.user.mention}, вы выбрали **{selected['name']}**. "
+            f"Начальный вектор: **{IDEOLOGIES[ideology.value]['name']}**. "
+            f"Ваш стартовый баланс: **{fmt(selected['treasury'])} кок**."
         )
 
     @app_commands.command(name="sostoyanie", description="Показать состояние страны")
@@ -959,12 +1007,35 @@ class GameCog(commands.Cog):
         if source["ideology"] == ideology.value:
             await interaction.response.send_message("Этот политический вектор уже установлен.", ephemeral=True)
             return
+        if time.time() - source["vector_change_at"] < 7 * 24 * 3600:
+            await interaction.response.send_message("Менять вектор можно не чаще одного раза в 7 дней.", ephemeral=True)
+            return
         if source["stability"] < 25:
             await interaction.response.send_message("Стабильность слишком низкая для смены режима.", ephemeral=True)
             return
-        self.bot.db.execute("UPDATE countries SET ideology = ?, approval = MAX(0, approval - 12), stability = MAX(0, stability - 8) WHERE guild_id = ? AND country_key = ?",
-                            (ideology.value, guild.id, source["country_key"]))
-        await interaction.response.send_message(f"🏛️ Страна перешла к вектору **{IDEOLOGIES[ideology.value]['name']}**.\n{IDEOLOGIES[ideology.value]['description']}")
+        party = self.bot.db.one(
+            "SELECT * FROM political_movements WHERE guild_id = ? AND country_key = ? "
+            "AND ideology = ? ORDER BY support DESC LIMIT 1",
+            (guild.id, source["country_key"], ideology.value),
+        )
+        if not party or party["support"] < 30:
+            await interaction.response.send_message(
+                "Нужна партия с выбранным вектором и поддержкой не менее 30%. "
+                "Создайте её через `/dvizhenie` или продвигайте через `/prodvinut_partiyu`.",
+                ephemeral=True,
+            )
+            return
+        self.bot.db.execute(
+            "UPDATE countries SET ideology = ?, active_party = ?, vector_change_at = ?, "
+            "approval = MAX(0, approval - 12), stability = MAX(0, stability - 8) "
+            "WHERE guild_id = ? AND country_key = ?",
+            (ideology.value, party["name"], time.time(), guild.id, source["country_key"]),
+        )
+        await interaction.response.send_message(
+            f"🏛️ Вектор изменён через одобрение партии **{party['name']}** "
+            f"(поддержка {party['support']}%). Одобрение власти снизилось на 12 пунктов.\n"
+            f"{IDEOLOGIES[ideology.value]['description']}"
+        )
 
     @app_commands.command(name="partii", description="Показать партии и локальные движения страны")
     async def parties(self, interaction: discord.Interaction):
@@ -976,12 +1047,19 @@ class GameCog(commands.Cog):
                                (guild.id, source["country_key"]))
         text = f"## Политическая жизнь — {source['name']}\n"
         text += f"Правящая партия: **{source['active_party']}**\n\n"
-        text += "\n".join(f"• **{r['name']}** — поддержка {r['support']}% ({r['effect']})" for r in rows) or "Локальных движений пока нет."
+        text += "\n".join(
+            f"• **{r['name']}** — {IDEOLOGIES.get(r['ideology'], IDEOLOGIES['democracy'])['name']}, "
+            f"поддержка {r['support']}% ({r['effect']})"
+            for r in rows
+        ) or "Партий пока нет."
         await interaction.response.send_message(text)
 
     @app_commands.command(name="dvizhenie", description="Создать локальное политическое движение")
-    @app_commands.describe(name="Название движения", effect="Чего требует движение")
-    async def movement(self, interaction: discord.Interaction, name: str, effect: str):
+    @app_commands.describe(name="Название партии", effect="Чего требует партия", ideology="Вектор партии")
+    @app_commands.choices(ideology=[
+        app_commands.Choice(name=data["name"], value=key) for key, data in IDEOLOGIES.items()])
+    async def movement(self, interaction: discord.Interaction, name: str, effect: str,
+                       ideology: app_commands.Choice[str]):
         guild = await self.guild(interaction)
         source = await self.active_country(interaction) if guild else None
         if not source:
@@ -991,11 +1069,46 @@ class GameCog(commands.Cog):
         if count >= 8:
             await interaction.response.send_message("В стране уже слишком много активных движений.", ephemeral=True)
             return
-        self.bot.db.execute("INSERT INTO political_movements (guild_id, country_key, name, effect, created_at) VALUES (?, ?, ?, ?, ?)",
-                            (guild.id, source["country_key"], name[:60], effect[:180], time.time()))
+        self.bot.db.execute(
+            "INSERT INTO political_movements (guild_id, country_key, name, effect, ideology, leader_id, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (guild.id, source["country_key"], name[:60], effect[:180], ideology.value,
+             interaction.user.id, time.time()),
+        )
         self.bot.db.execute("UPDATE countries SET approval = MAX(0, approval - 2), stability = MAX(0, stability - 1) WHERE guild_id = ? AND country_key = ?",
                             (guild.id, source["country_key"]))
-        await interaction.response.send_message(f"📣 Движение **{name[:60]}** появилось на локальной политической сцене.")
+        await interaction.response.send_message(
+            f"📣 Партия **{name[:60]}** создана. Вектор: **{IDEOLOGIES[ideology.value]['name']}**. "
+            "Её поддержка будет меняться со временем."
+        )
+
+    @app_commands.command(name="prodvinut_partiyu", description="Продвинуть партию и увеличить её популярность")
+    @app_commands.describe(name="Название партии", amount="Сколько кок потратить на продвижение")
+    async def promote_party(self, interaction: discord.Interaction, name: str, amount: int):
+        guild = await self.guild(interaction)
+        source = await self.active_country(interaction) if guild else None
+        if not source:
+            return
+        amount = max(1_000, min(100_000, amount))
+        party = self.bot.db.one(
+            "SELECT * FROM political_movements WHERE guild_id = ? AND country_key = ? "
+            "AND lower(name) = lower(?)",
+            (guild.id, source["country_key"], name[:60]),
+        )
+        if not party:
+            await interaction.response.send_message("Партия не найдена в вашей стране.", ephemeral=True)
+            return
+        if not self.bot.db.change_account(guild.id, source["country_key"], -amount):
+            await interaction.response.send_message("Недостаточно кок.", ephemeral=True)
+            return
+        points = max(1, min(20, amount // 5_000))
+        self.bot.db.execute(
+            "UPDATE political_movements SET support = MIN(100, support + ?) WHERE id = ?",
+            (points, party["id"]),
+        )
+        await interaction.response.send_message(
+            f"📣 Продвижение партии **{party['name']}** завершено: +{points}% популярности за {fmt(amount)} кок."
+        )
 
     @app_commands.command(name="naemniki", description="Показать доступные ЧВК и контракты")
     async def mercenaries(self, interaction: discord.Interaction):
@@ -1616,6 +1729,64 @@ class GameCog(commands.Cog):
         await self.bot.level_role(interaction.guild, member, True)
         await interaction.response.send_message(f"Опыт {member.mention} установлен: {xp:.0f} XP.", ephemeral=True)
 
+    @app_commands.command(name="admin_uroven", description="Админ: установить уровень пользователя")
+    @app_commands.describe(code="Защитный код", member="Участник", level="Новый уровень от 1 до 150")
+    async def admin_level(self, interaction: discord.Interaction, code: str,
+                          member: discord.Member, level: int):
+        if not await self.admin(interaction, code):
+            return
+        level = max(1, min(MAX_LEVEL, level))
+        xp = XP_THRESHOLDS[level - 1]
+        self.bot.db.ensure_user(interaction.guild.id, member.id)
+        self.bot.db.execute(
+            "UPDATE users SET xp = ? WHERE guild_id = ? AND user_id = ?",
+            (xp, interaction.guild.id, member.id),
+        )
+        await self.bot.level_role(interaction.guild, member, True)
+        await interaction.response.send_message(
+            f"Уровень {member.mention} установлен: **{level}**.", ephemeral=True
+        )
+
+    @app_commands.command(name="admin_politika", description="Админ: изменить политические значения страны")
+    @app_commands.describe(code="Защитный код", country="Страна", field="Параметр",
+                           amount="Новое значение")
+    @app_commands.choices(country=ALL_CHOICES, field=[
+        app_commands.Choice(name="Одобрение власти", value="approval"),
+        app_commands.Choice(name="Качество жизни", value="quality_of_life"),
+        app_commands.Choice(name="Преступность", value="crime"),
+        app_commands.Choice(name="Стабильность", value="stability"),
+    ])
+    async def admin_politics(self, interaction: discord.Interaction, code: str,
+                              country: app_commands.Choice[str],
+                              field: app_commands.Choice[str], amount: int):
+        if not await self.admin(interaction, code):
+            return
+        amount = max(0, min(100, amount))
+        self.bot.db.execute(
+            f"UPDATE countries SET {field.value} = ? WHERE guild_id = ? AND country_key = ?",
+            (amount, interaction.guild.id, country.value),
+        )
+        await interaction.response.send_message(
+            f"Параметр «{field.name}» страны установлен: **{amount}%**.", ephemeral=True
+        )
+
+    @app_commands.command(name="admin_vektor", description="Админ: установить политический вектор страны")
+    @app_commands.describe(code="Защитный код", country="Страна", ideology="Новый вектор")
+    @app_commands.choices(country=ALL_CHOICES, ideology=[
+        app_commands.Choice(name=data["name"], value=key) for key, data in IDEOLOGIES.items()])
+    async def admin_vector(self, interaction: discord.Interaction, code: str,
+                           country: app_commands.Choice[str],
+                           ideology: app_commands.Choice[str]):
+        if not await self.admin(interaction, code):
+            return
+        self.bot.db.execute(
+            "UPDATE countries SET ideology = ?, vector_change_at = 0 WHERE guild_id = ? AND country_key = ?",
+            (ideology.value, interaction.guild.id, country.value),
+        )
+        await interaction.response.send_message(
+            f"Вектор страны установлен: **{ideology.name}**.", ephemeral=True
+        )
+
     @app_commands.command(name="admin_armiya", description="Админ: установить армию страны")
     @app_commands.describe(code="Защитный код", country="Страна", amount="Армия")
     @app_commands.choices(country=ALL_CHOICES)
@@ -1658,6 +1829,122 @@ class GameCog(commands.Cog):
         level = max(0, min(5, level))
         self.bot.db.execute("UPDATE countries SET industry_level = ?, last_income_at = ? WHERE guild_id = ? AND country_key = ?", (level, time.time(), interaction.guild.id, country.value))
         await interaction.response.send_message(f"Уровень предприятий установлен: {level}.", ephemeral=True)
+
+    @app_commands.command(name="admin_dobavit_predpriyatie", description="Админ: добавить предприятие и установить его уровень")
+    @app_commands.describe(code="Защитный код", country="Страна",
+                           level="Итоговый уровень предприятий от 0 до 5")
+    @app_commands.choices(country=ALL_CHOICES)
+    async def admin_add_enterprise(self, interaction: discord.Interaction, code: str,
+                                   country: app_commands.Choice[str], level: int):
+        if not await self.admin(interaction, code):
+            return
+        level = max(0, min(5, level))
+        self.bot.db.execute(
+            "UPDATE countries SET industry_level = ?, last_income_at = ? "
+            "WHERE guild_id = ? AND country_key = ?",
+            (level, time.time(), interaction.guild.id, country.value),
+        )
+        income = ENTERPRISES[level]["income"] if level else 0
+        await interaction.response.send_message(
+            f"Предприятие страны **{country.name}** установлено на уровень **{level}** "
+            f"(доход: {income} кок/час).", ephemeral=True
+        )
+
+    @app_commands.command(name="admin_naselenie", description="Админ: установить население страны")
+    @app_commands.describe(code="Защитный код", country="Страна", amount="Новое население")
+    @app_commands.choices(country=ALL_CHOICES)
+    async def admin_population(self, interaction: discord.Interaction, code: str,
+                               country: app_commands.Choice[str], amount: int):
+        if not await self.admin(interaction, code):
+            return
+        amount = max(1_000, amount)
+        self.bot.db.execute(
+            "UPDATE countries SET population = ? WHERE guild_id = ? AND country_key = ?",
+            (amount, interaction.guild.id, country.value),
+        )
+        await interaction.response.send_message(
+            f"Население страны установлено: {fmt(amount)}.", ephemeral=True
+        )
+
+    @app_commands.command(name="admin_kazna", description="Админ: установить казну страны")
+    @app_commands.describe(code="Защитный код", country="Страна", amount="Новая казна в кок")
+    @app_commands.choices(country=ALL_CHOICES)
+    async def admin_treasury(self, interaction: discord.Interaction, code: str,
+                             country: app_commands.Choice[str], amount: int):
+        if not await self.admin(interaction, code):
+            return
+        amount = max(0, amount)
+        row = self.bot.db.one(
+            "SELECT owner_id FROM countries WHERE guild_id = ? AND country_key = ?",
+            (interaction.guild.id, country.value),
+        )
+        self.bot.db.execute(
+            "UPDATE countries SET treasury = ? WHERE guild_id = ? AND country_key = ?",
+            (amount, interaction.guild.id, country.value),
+        )
+        if row and row["owner_id"]:
+            self.bot.db.ensure_user(interaction.guild.id, row["owner_id"])
+            self.bot.db.execute(
+                "UPDATE users SET coins = ? WHERE guild_id = ? AND user_id = ?",
+                (amount, interaction.guild.id, row["owner_id"]),
+            )
+        await interaction.response.send_message(
+            f"Казна страны установлена: {fmt(amount)} кок.", ephemeral=True
+        )
+
+    @app_commands.command(name="admin_resursy", description="Админ: установить военный ресурс страны")
+    @app_commands.describe(code="Защитный код", country="Страна", resource="Ресурс",
+                           amount="Новое значение")
+    @app_commands.choices(country=ALL_CHOICES, resource=[
+        app_commands.Choice(name="Мечники", value="swordsmen"),
+        app_commands.Choice(name="Лучники", value="archers"),
+        app_commands.Choice(name="Осадные орудия", value="siege"),
+        app_commands.Choice(name="Требушеты", value="trebuchets"),
+        app_commands.Choice(name="Конница", value="cavalry"),
+        app_commands.Choice(name="Морской десант", value="marines"),
+        app_commands.Choice(name="Флот", value="fleet"),
+        app_commands.Choice(name="Верфь", value="shipyard"),
+        app_commands.Choice(name="Генералы", value="generals"),
+        app_commands.Choice(name="Укрепление столицы", value="capital_fort"),
+        app_commands.Choice(name="Укрепление провинций", value="province_fort"),
+    ])
+    async def admin_resources(self, interaction: discord.Interaction, code: str,
+                              country: app_commands.Choice[str],
+                              resource: app_commands.Choice[str], amount: int):
+        if not await self.admin(interaction, code):
+            return
+        amount = max(0, amount)
+        self.bot.db.execute(
+            f"UPDATE countries SET {resource.value} = ? WHERE guild_id = ? AND country_key = ?",
+            (amount, interaction.guild.id, country.value),
+        )
+        await interaction.response.send_message(
+            f"Ресурс «{resource.name}» установлен: {fmt(amount)}.", ephemeral=True
+        )
+
+    @app_commands.command(name="admin_user_stat", description="Админ: установить статистику пользователя")
+    @app_commands.describe(code="Защитный код", member="Участник", field="Параметр",
+                           amount="Новое значение")
+    @app_commands.choices(field=[
+        app_commands.Choice(name="Сообщения", value="messages"),
+        app_commands.Choice(name="Голосовые секунды", value="voice_seconds"),
+        app_commands.Choice(name="Победы", value="year_wins"),
+        app_commands.Choice(name="Счётчик гамбы", value="gamba_count"),
+    ])
+    async def admin_user_stat(self, interaction: discord.Interaction, code: str,
+                              member: discord.Member, field: app_commands.Choice[str],
+                              amount: int):
+        if not await self.admin(interaction, code):
+            return
+        self.bot.db.ensure_user(interaction.guild.id, member.id)
+        self.bot.db.execute(
+            f"UPDATE users SET {field.value} = ? WHERE guild_id = ? AND user_id = ?",
+            (max(0, amount), interaction.guild.id, member.id),
+        )
+        await interaction.response.send_message(
+            f"Параметр «{field.name}» пользователя {member.mention} установлен: "
+            f"{max(0, amount)}.", ephemeral=True
+        )
 
     @app_commands.command(name="admin_sbros", description="Админ: выполнить большой игровой сброс")
     @app_commands.describe(code="Защитный код")
